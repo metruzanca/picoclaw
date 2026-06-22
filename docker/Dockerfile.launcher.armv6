@@ -1,0 +1,78 @@
+# ============================================================
+# Stage 1: Build frontend assets (Node.js + pnpm) - native arch
+# ============================================================
+FROM --platform=$BUILDPLATFORM node:24-alpine3.23 AS frontend
+
+RUN corepack enable && corepack prepare pnpm@latest --activate
+
+WORKDIR /src/web/frontend
+
+COPY web/frontend/package.json web/frontend/pnpm-lock.yaml ./
+RUN CI=true pnpm install --frozen-lockfile
+
+COPY web/frontend/ ./
+RUN pnpm build:backend
+
+# ============================================================
+# Stage 2: Build Go binaries for target arch
+# ============================================================
+FROM --platform=$TARGETPLATFORM golang:1.25-alpine AS builder
+
+ARG TARGETOS TARGETARCH TARGETVARIANT
+
+RUN apk add --no-cache git make
+
+WORKDIR /src
+
+COPY go.mod go.sum ./
+RUN go mod download
+
+COPY . .
+
+COPY --from=frontend /src/web/backend/dist web/backend/dist
+
+# Convert uname arch to Go arch, then run go generate
+RUN GOARM_VALUE=""; \
+    if [ "$TARGETARCH" = "arm" ]; then \
+      case "$TARGETVARIANT" in \
+        v5) GOARM_VALUE=5;; \
+        v6) GOARM_VALUE=6;; \
+        v7|"") GOARM_VALUE=7;; \
+        *) GOARM_VALUE=7;; \
+      esac; \
+    fi; \
+    echo "GOARM_VALUE=$$GOARM_VALUE" > /tmp/goarch.env
+
+# go generate
+RUN rm -rf ./cmd/picoclaw/workspace 2>/dev/null || true; \
+    . /tmp/goarch.env; \
+    GOOS=$TARGETOS GOARCH=$TARGETARCH GOARM=$GOARM_VALUE go generate ./...
+
+# Build picoclaw binary
+RUN mkdir -p build && \
+    . /tmp/goarch.env; \
+    GOOS=$TARGETOS GOARCH=$TARGETARCH GOARM=$GOARM_VALUE CGO_ENABLED=0 go build -v -tags goolm,stdjson \
+      -ldflags "-X github.com/sipeed/picoclaw/pkg/config.Version=$(git describe --tags --always --dirty 2>/dev/null || echo dev) -X github.com/sipeed/picoclaw/pkg/config.GitCommit=$(git rev-parse --short=8 HEAD 2>/dev/null || echo dev) -X github.com/sipeed/picoclaw/pkg/config.BuildTime=$(date +%FT%T%z) -X github.com/sipeed/picoclaw/pkg/config.GoVersion=$(go env GOVERSION) -s -w" \
+      -o build/picoclaw ./cmd/picoclaw/
+
+# Build picoclaw-launcher binary
+RUN . /tmp/goarch.env; \
+    GOOS=$TARGETOS GOARCH=$TARGETARCH GOARM=$GOARM_VALUE CGO_ENABLED=0 go build -v -tags goolm,stdjson \
+      -ldflags "-X github.com/sipeed/picoclaw/pkg/config.Version=$(git describe --tags --always --dirty 2>/dev/null || echo dev) -X github.com/sipeed/picoclaw/pkg/config.GitCommit=$(git rev-parse --short=8 HEAD 2>/dev/null || echo dev) -X github.com/sipeed/picoclaw/pkg/config.BuildTime=$(date +%FT%T%z) -X github.com/sipeed/picoclaw/pkg/config.GoVersion=$(go env GOVERSION) -s -w" \
+      -o build/picoclaw-launcher ./web/backend/
+
+# ============================================================
+# Stage 3: Minimal runtime image for target arch
+# ============================================================
+FROM --platform=$TARGETPLATFORM alpine:3.23
+
+RUN apk add --no-cache ca-certificates tzdata curl
+
+HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
+  CMD wget -q --spider http://localhost:18790/health || exit 1
+
+COPY --from=builder /src/build/picoclaw /usr/local/bin/picoclaw
+COPY --from=builder /src/build/picoclaw-launcher /usr/local/bin/picoclaw-launcher
+
+ENTRYPOINT ["picoclaw-launcher"]
+CMD ["-console", "-public", "-no-browser"]
