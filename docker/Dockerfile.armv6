@@ -1,5 +1,6 @@
 FROM alpine:3.23
-RUN apk add --no-cache ca-certificates tzdata curl
+RUN apk add --no-cache ca-certificates tzdata curl nodejs npm && \
+    npm install -g @steipete/summarize
 COPY docker/picoclaw /usr/local/bin/picoclaw
 COPY docker/entrypoint.sh /entrypoint.sh
 RUN chmod +x /entrypoint.sh
